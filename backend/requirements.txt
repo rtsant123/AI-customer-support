@@ -16,3 +16,4 @@ celery==5.4.0
 tenacity==8.3.0
 phonenumbers==8.13.37
 pytz==2024.1
+twilio==9.1.1

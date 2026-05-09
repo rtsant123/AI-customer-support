@@ -1,16 +1,19 @@
-"""Exotel and Razorpay webhook handlers."""
+"""Twilio and Razorpay webhook handlers, including real-time Media Stream WebSocket."""
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import hashlib
 import hmac
+import json
 import logging
 import math
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Form, Header, HTTPException, Request, status
+from fastapi import APIRouter, Form, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import JSONResponse, Response
 
 from config import settings
@@ -19,6 +22,9 @@ from services.ai_pipeline import (
     AIConversation,
     generate_call_summary,
     start_conversation,
+    mulaw_to_pcm,
+    pcm_to_mulaw,
+    pcm_to_wav,
 )
 from services.call_manager import schedule_callback_retry
 from services.dnd_filter import add_to_blacklist
@@ -28,68 +34,54 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/webhook", tags=["webhooks"])
 
-_CALL_CONNECT_XML = """<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say>{greeting}</Say>
-</Response>"""
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-_TRANSFER_XML = """<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Dial>{transfer_number}</Dial>
-</Response>"""
-
-
-def _xml_response(content: str) -> Response:
+def _xml(content: str) -> Response:
     return Response(content=content, media_type="application/xml")
 
 
+def _hangup_xml() -> Response:
+    return _xml('<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>')
+
+
+def _media_stream_xml(call_sid: str) -> Response:
+    """Return TwiML that opens a bidirectional Media Stream WebSocket."""
+    ws_url = f"{settings.backend_url.replace('https://', 'wss://').replace('http://', 'ws://')}/api/webhook/twilio/media-stream/{call_sid}"
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Connect>
+    <Stream url="{ws_url}" track="inbound_track">
+      <Parameter name="call_sid" value="{call_sid}"/>
+    </Stream>
+  </Connect>
+</Response>"""
+    return _xml(xml)
+
+
 # ---------------------------------------------------------------------------
-# Exotel: Call Connected
+# Twilio: Call Connected (fetched when recipient picks up)
 # ---------------------------------------------------------------------------
 
-@router.post("/exotel/call-connected")
-async def exotel_call_connected(
+@router.post("/twilio/call-connected")
+async def twilio_call_connected(
+    request: Request,
+    campaign_id: str = Query(...),
+    phone_number_id: str = Query(...),
+    client_id: str = Query(...),
+    call_id: str = Query(...),
     CallSid: str = Form(...),
-    From: str = Form(...),
-    To: str = Form(...),
-    Direction: Optional[str] = Form(None),
-    Status: Optional[str] = Form(None),
+    CallStatus: Optional[str] = Form(None),
 ) -> Response:
     """
-    Handle Exotel's call-connected webhook.
+    Twilio fetches this URL when the call connects.
 
-    Called when the recipient picks up. We:
-    1. Look up the phone_number record by the dialled number.
-    2. Fetch campaign + system_prompt.
-    3. Verify the client has sufficient wallet balance.
-    4. Create/link the call record.
-    5. Start the AI conversation and return opening audio as TwiML/XML.
+    We verify wallet balance, initialise the AI conversation in Redis, then
+    return TwiML that opens a bidirectional Media Stream WebSocket so we can
+    run the real-time STT → Claude → TTS pipeline.
     """
-    logger.info("Call connected: CallSid=%s From=%s To=%s", CallSid, From, To)
-
-    # Normalize: Exotel's "To" is the customer number
-    customer_number = To if Direction != "outbound" else From
-
-    # Find phone_number record
-    pn_resp = (
-        supabase_admin.table("phone_numbers")
-        .select("id, campaign_id, client_id, number")
-        .eq("number", customer_number)
-        .eq("status", "calling")
-        .order("last_attempt_at", desc=True)
-        .limit(1)
-        .execute()
-    )
-    if not pn_resp.data:
-        logger.warning("No phone_number record found for %s (CallSid=%s)", customer_number, CallSid)
-        return _xml_response(
-            '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
-        )
-
-    pn = pn_resp.data[0]
-    phone_number_id = pn["id"]
-    campaign_id = pn["campaign_id"]
-    client_id = pn["client_id"]
+    logger.info("Call connected: CallSid=%s campaign=%s", CallSid, campaign_id)
 
     # Load campaign
     campaign_resp = (
@@ -101,125 +93,278 @@ async def exotel_call_connected(
     )
     if not campaign_resp.data:
         logger.error("Campaign %s not found for CallSid=%s", campaign_id, CallSid)
-        return _xml_response(
-            '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
-        )
+        return _hangup_xml()
 
     campaign = campaign_resp.data
-    system_prompt: str = campaign["system_prompt"]
-    language: str = campaign["language"]
+    min_balance = settings.rate_per_min_paise * 2  # require at least 2 minutes
 
-    # Check wallet balance (minimum 2 minutes = 2 * rate)
-    min_balance = settings.rate_per_min_paise * 2
     if not await wallet_manager.has_sufficient_balance(client_id, min_balance):
-        logger.warning("Insufficient balance for client %s — hanging up call %s", client_id, CallSid)
-        # Pause the campaign to avoid wasting calls
-        supabase_admin.table("campaigns").update({"status": "paused"}).eq(
-            "id", campaign_id
-        ).execute()
-        return _xml_response(
-            '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
-        )
+        logger.warning("Insufficient balance for client %s — hanging up %s", client_id, CallSid)
+        supabase_admin.table("campaigns").update({"status": "paused"}).eq("id", campaign_id).execute()
+        return _hangup_xml()
 
-    # Find or create call record (call_manager.initiate_call already created one)
-    call_resp = (
-        supabase_admin.table("calls")
-        .select("id")
-        .eq("call_sid", CallSid)
-        .single()
-        .execute()
-    )
-    if call_resp.data:
-        call_id = call_resp.data["id"]
-        # Mark as in-progress
-        supabase_admin.table("calls").update({"status": "in_progress"}).eq(
-            "id", call_id
-        ).execute()
-    else:
-        # Fallback: create a new call record
-        call_id = str(uuid.uuid4())
-        now = datetime.now(timezone.utc).isoformat()
-        supabase_admin.table("calls").insert(
-            {
-                "id": call_id,
-                "campaign_id": campaign_id,
-                "phone_number_id": phone_number_id,
-                "client_id": client_id,
-                "call_sid": CallSid,
-                "status": "in_progress",
-                "started_at": now,
-            }
-        ).execute()
+    # Mark call as connected
+    now = datetime.now(timezone.utc).isoformat()
+    supabase_admin.table("calls").update({
+        "call_sid": CallSid,
+        "status": "connected",
+        "started_at": now,
+    }).eq("id", call_id).execute()
 
-    # Increment attempt counter via RPC (atomic increment in DB)
-    supabase_admin.rpc("increment_phone_number_attempts", {"row_id": phone_number_id}).execute()
+    # Increment attempt counter
+    supabase_admin.table("phone_numbers").update({
+        "status": "calling",
+        "attempts": supabase_admin.table("phone_numbers")
+            .select("attempts")
+            .eq("id", phone_number_id)
+            .single()
+            .execute()
+            .data.get("attempts", 0) + 1,
+        "last_attempt_at": now,
+    }).eq("id", phone_number_id).execute()
 
-    # Start the AI conversation state in Redis
+    # Initialise AI conversation state in Redis
     await start_conversation(
         call_sid=CallSid,
-        system_prompt=system_prompt,
-        language=language,
+        system_prompt=campaign["system_prompt"],
+        language=campaign["language"],
+        agent_gender=campaign.get("agent_gender", "female"),
         campaign_id=campaign_id,
         phone_number_id=phone_number_id,
         client_id=client_id,
         call_id=call_id,
     )
 
-    logger.info("AI conversation started for CallSid=%s, call_id=%s", CallSid, call_id)
-
-    # Return initial XML — Exotel streams audio back via subsequent webhooks.
-    # We return a <Say> greeting as a placeholder; in a full deployment
-    # with Exotel's streaming API this would be a <Stream> verb.
-    greeting = (
-        "नमस्ते" if language == "hindi"
-        else "Namaskar" if language == "bangla"
-        else "Vanakkam" if language == "tamil"
-        else "Hello"
-    )
-    xml_body = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say language="{_tts_lang_code(language)}">{greeting}</Say>
-    <Pause length="1"/>
-</Response>"""
-    return _xml_response(xml_body)
-
-
-def _tts_lang_code(language: str) -> str:
-    return {
-        "hindi": "hi-IN",
-        "english": "en-IN",
-        "bangla": "bn-IN",
-        "tamil": "ta-IN",
-    }.get(language, "en-IN")
+    # Return TwiML — Twilio will open a WebSocket to our /media-stream/{call_sid} endpoint
+    return _media_stream_xml(CallSid)
 
 
 # ---------------------------------------------------------------------------
-# Exotel: Call Completed
+# Twilio: Media Stream WebSocket (real-time AI pipeline)
 # ---------------------------------------------------------------------------
 
-@router.post("/exotel/call-completed")
-async def exotel_call_completed(
+# Silence detection constants
+_SAMPLE_RATE = 8000          # Twilio mulaw is always 8kHz
+_SILENCE_THRESHOLD = 200     # RMS amplitude threshold (0-32767 range)
+_SPEECH_MIN_CHUNKS = 5       # ~125ms of speech to start collecting
+_SILENCE_CHUNKS_TO_END = 16  # ~400ms of silence after speech to trigger STT
+
+
+@router.websocket("/twilio/media-stream/{call_sid}")
+async def twilio_media_stream(websocket: WebSocket, call_sid: str) -> None:
+    """
+    Bidirectional Twilio Media Stream WebSocket handler.
+
+    Audio protocol:
+    - Twilio sends mulaw 8kHz, 20ms chunks (~160 bytes per chunk)
+    - We accumulate chunks, detect speech, run STT → Claude → TTS
+    - We send back mulaw audio frames to Twilio
+
+    Message format (Twilio → server):
+      {"event": "media", "streamSid": "...", "media": {"payload": "<base64 mulaw>"}}
+
+    Message format (server → Twilio):
+      {"event": "media", "streamSid": "...", "media": {"payload": "<base64 mulaw>"}}
+      {"event": "clear", "streamSid": "..."}  # clears Twilio's audio buffer
+    """
+    await websocket.accept()
+    logger.info("Media stream WebSocket opened for call_sid=%s", call_sid)
+
+    stream_sid: Optional[str] = None
+    conversation: Optional[AIConversation] = None
+
+    # Audio accumulation buffers
+    audio_buffer: list[bytes] = []       # raw mulaw chunks being collected
+    speech_chunks: int = 0               # consecutive chunks above threshold
+    silence_chunks: int = 0              # consecutive silent chunks after speech
+    is_collecting: bool = False          # are we mid-utterance?
+    processing_lock = asyncio.Lock()     # one pipeline run at a time
+    is_processing: bool = False
+
+    try:
+        # Send opening greeting once conversation is loaded
+        async def send_opening() -> None:
+            nonlocal conversation
+            conversation = await AIConversation.load_from_redis(call_sid)
+            if not conversation:
+                logger.error("No conversation state for call_sid=%s", call_sid)
+                return
+            audio_bytes = await conversation.get_opening_audio()
+            await _send_audio(websocket, stream_sid, audio_bytes)
+
+        async def process_speech(pcm_chunks: list[bytes]) -> None:
+            nonlocal is_processing, conversation
+            if is_processing or not conversation:
+                return
+            is_processing = True
+            try:
+                # Send filler sound immediately while pipeline runs
+                filler_audio = await conversation.get_filler_audio(conversation.language)
+                await _send_audio(websocket, stream_sid, filler_audio)
+
+                # Concatenate PCM chunks and wrap in WAV for Sarvam STT
+                pcm_data = b"".join(pcm_chunks)
+                wav_data = pcm_to_wav(pcm_data, sample_rate=_SAMPLE_RATE)
+
+                # STT → Claude → TTS
+                response_audio = await conversation.process_utterance(wav_data)
+
+                # Clear any buffered audio then play response
+                if stream_sid:
+                    await websocket.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
+                await _send_audio(websocket, stream_sid, response_audio)
+
+                # Check if conversation should end
+                if conversation.lead_status is not None:
+                    logger.info(
+                        "Call %s ending with lead_status=%s",
+                        call_sid,
+                        conversation.lead_status,
+                    )
+                    # Small delay so final audio plays before hang-up
+                    await asyncio.sleep(3)
+                    if stream_sid:
+                        await websocket.send_text(
+                            json.dumps({"event": "clear", "streamSid": stream_sid})
+                        )
+                    await websocket.close()
+            except Exception as exc:
+                logger.error("Pipeline error for call_sid=%s: %s", call_sid, exc)
+            finally:
+                is_processing = False
+
+        while True:
+            raw = await websocket.receive_text()
+            msg = json.loads(raw)
+            event = msg.get("event")
+
+            if event == "connected":
+                # First message — stream hasn't started yet
+                continue
+
+            elif event == "start":
+                stream_sid = msg["start"]["streamSid"]
+                logger.info("Stream started: streamSid=%s call_sid=%s", stream_sid, call_sid)
+                # Fire off opening greeting in background
+                asyncio.create_task(send_opening())
+
+            elif event == "media":
+                if stream_sid is None:
+                    continue
+                payload_b64: str = msg["media"]["payload"]
+                mulaw_chunk = base64.b64decode(payload_b64)
+                pcm_chunk = mulaw_to_pcm(mulaw_chunk)
+
+                # Silence detection via RMS amplitude
+                rms = _rms(pcm_chunk)
+
+                if rms > _SILENCE_THRESHOLD:
+                    speech_chunks += 1
+                    silence_chunks = 0
+                    if speech_chunks >= _SPEECH_MIN_CHUNKS:
+                        is_collecting = True
+                else:
+                    silence_chunks += 1
+                    if is_collecting:
+                        # Still collecting — keep a few silence frames for natural endings
+                        if silence_chunks > _SILENCE_CHUNKS_TO_END:
+                            # End of utterance detected
+                            if audio_buffer and not is_processing:
+                                chunks_to_process = list(audio_buffer)
+                                audio_buffer.clear()
+                                is_collecting = False
+                                speech_chunks = 0
+                                silence_chunks = 0
+                                async with processing_lock:
+                                    asyncio.create_task(process_speech(chunks_to_process))
+
+                if is_collecting:
+                    audio_buffer.append(pcm_chunk)
+
+                # Safety: prevent unbounded buffer (~30 seconds max)
+                if len(audio_buffer) > 1500:
+                    audio_buffer.clear()
+                    is_collecting = False
+                    speech_chunks = 0
+
+            elif event == "stop":
+                logger.info("Stream stopped for call_sid=%s", call_sid)
+                break
+
+    except WebSocketDisconnect:
+        logger.info("WebSocket disconnected for call_sid=%s", call_sid)
+    except Exception as exc:
+        logger.error("Media stream error for call_sid=%s: %s", call_sid, exc)
+    finally:
+        logger.info("Media stream closed for call_sid=%s", call_sid)
+
+
+async def _send_audio(
+    websocket: WebSocket,
+    stream_sid: Optional[str],
+    audio_bytes: bytes,
+) -> None:
+    """
+    Send WAV/PCM audio to Twilio as mulaw chunks.
+
+    Twilio expects mulaw encoded audio streamed in small frames,
+    not one large blob.
+    """
+    if not stream_sid or not audio_bytes:
+        return
+
+    # Convert WAV → raw PCM → mulaw
+    # If audio_bytes is already raw PCM (from Sarvam at 8kHz), skip WAV strip
+    pcm = _strip_wav_header(audio_bytes)
+    mulaw = pcm_to_mulaw(pcm)
+
+    # Chunk into 160-byte frames (20ms at 8kHz)
+    chunk_size = 160
+    for i in range(0, len(mulaw), chunk_size):
+        chunk = mulaw[i : i + chunk_size]
+        payload = base64.b64encode(chunk).decode("ascii")
+        await websocket.send_text(json.dumps({
+            "event": "media",
+            "streamSid": stream_sid,
+            "media": {"payload": payload},
+        }))
+
+
+def _strip_wav_header(data: bytes) -> bytes:
+    """Remove 44-byte WAV header if present, returning raw PCM."""
+    if data[:4] == b"RIFF":
+        return data[44:]
+    return data
+
+
+def _rms(pcm: bytes) -> float:
+    """Compute RMS amplitude of 16-bit little-endian PCM data."""
+    if len(pcm) < 2:
+        return 0.0
+    import struct
+    n = len(pcm) // 2
+    samples = struct.unpack(f"<{n}h", pcm[: n * 2])
+    return (sum(s * s for s in samples) / n) ** 0.5
+
+
+# ---------------------------------------------------------------------------
+# Twilio: Call Status Callback
+# ---------------------------------------------------------------------------
+
+@router.post("/twilio/call-status")
+async def twilio_call_status(
     CallSid: str = Form(...),
-    Status: str = Form(...),
-    Duration: Optional[str] = Form("0"),
-    RecordingUrl: Optional[str] = Form(None),
+    CallStatus: str = Form(...),
+    CallDuration: Optional[str] = Form("0"),
 ) -> JSONResponse:
     """
-    Handle Exotel's call-completed webhook.
-
-    Responsibilities:
-    - Calculate and deduct call cost from wallet.
-    - Update call record with duration, cost, recording URL, status.
-    - Generate AI summary of transcript.
-    - Update phone_number lead_status.
-    - Schedule CALLBACK retries if applicable.
-    - Log INTERESTED leads for WhatsApp notification.
+    Twilio calls this when call status changes (completed / failed / no-answer / busy).
+    Handles cost deduction, summary generation, and lead tagging.
     """
-    logger.info("Call completed: CallSid=%s Status=%s Duration=%s", CallSid, Status, Duration)
+    logger.info("Call status: CallSid=%s Status=%s Duration=%s", CallSid, CallStatus, CallDuration)
 
-    duration_seconds = int(Duration or "0")
+    duration_seconds = int(CallDuration or "0")
 
-    # Load call record
     call_resp = (
         supabase_admin.table("calls")
         .select("*")
@@ -229,7 +374,7 @@ async def exotel_call_completed(
     )
     if not call_resp.data:
         logger.warning("No call record for CallSid=%s", CallSid)
-        return JSONResponse(content={"ok": False, "detail": "Call not found"})
+        return JSONResponse(content={"ok": False})
 
     call = call_resp.data
     call_id = call["id"]
@@ -237,28 +382,23 @@ async def exotel_call_completed(
     campaign_id = call["campaign_id"]
     phone_number_id = call["phone_number_id"]
 
-    # Calculate cost: ceil(duration / 60) minutes × rate
     billable_minutes = math.ceil(duration_seconds / 60) if duration_seconds > 0 else 0
     cost_paise = billable_minutes * settings.rate_per_min_paise
 
-    # Deduct from wallet
     if cost_paise > 0:
-        deducted = await wallet_manager.deduct(
+        await wallet_manager.deduct(
             client_id=client_id,
             amount_paise=cost_paise,
             description=f"Call charge: {billable_minutes} min × ₹{settings.rate_per_min_paise / 100:.2f}/min",
             call_id=call_id,
         )
-        if not deducted:
-            logger.warning("Could not deduct %d paise for call %s — insufficient balance", cost_paise, call_id)
 
-    # Recover conversation state for transcript and lead_status
+    # Recover transcript and lead_status from Redis conversation state
     conversation = await AIConversation.load_from_redis(CallSid)
     transcript: Optional[str] = None
     lead_status: Optional[str] = None
 
     if conversation:
-        # Build transcript from history
         lines = []
         for msg in conversation.conversation_history:
             role = "Customer" if msg["role"] == "user" else "Agent"
@@ -266,22 +406,17 @@ async def exotel_call_completed(
         transcript = "\n".join(lines) if lines else None
         lead_status = conversation.lead_status
         await conversation.delete_state()
-    else:
-        logger.warning("No Redis conversation state found for CallSid=%s", CallSid)
 
-    # Map Exotel call status to our statuses
-    call_status_map = {
+    status_map = {
         "completed": "completed",
         "busy": "failed",
         "no-answer": "no_answer",
         "canceled": "failed",
         "failed": "failed",
     }
-    final_status = call_status_map.get(Status.lower(), "completed")
-
+    final_status = status_map.get(CallStatus.lower(), "completed")
     now = datetime.now(timezone.utc).isoformat()
 
-    # Generate AI summary if we have a transcript
     ai_summary: Optional[str] = None
     if transcript:
         try:
@@ -292,37 +427,29 @@ async def exotel_call_completed(
                 .single()
                 .execute()
             )
-            campaign_goal = campaign_resp.data["goal"] if campaign_resp.data else "qualify"
-            ai_summary = await generate_call_summary(transcript, campaign_goal)
+            goal = campaign_resp.data["goal"] if campaign_resp.data else "qualify"
+            ai_summary = await generate_call_summary(transcript, goal)
         except Exception as exc:
-            logger.error("AI summary generation failed for call %s: %s", call_id, exc)
+            logger.error("Summary generation failed for call %s: %s", call_id, exc)
 
-    # Update call record
-    supabase_admin.table("calls").update(
-        {
-            "status": final_status,
-            "duration_seconds": duration_seconds,
-            "cost_paise": cost_paise,
-            "recording_url": RecordingUrl,
-            "transcript": transcript,
-            "ai_summary": ai_summary,
-            "lead_status": lead_status,
-            "ended_at": now,
-        }
-    ).eq("id", call_id).execute()
+    supabase_admin.table("calls").update({
+        "status": final_status,
+        "duration_seconds": duration_seconds,
+        "cost_paise": cost_paise,
+        "transcript": transcript,
+        "ai_summary": ai_summary,
+        "lead_status": lead_status,
+        "ended_at": now,
+    }).eq("id", call_id).execute()
 
-    # Update phone_number status
     pn_update: dict = {"status": "called"}
     if lead_status:
-        pn_update["lead_status"] = lead_status
+        pn_update["status"] = lead_status.lower()
     supabase_admin.table("phone_numbers").update(pn_update).eq("id", phone_number_id).execute()
 
-    # Handle CALLBACK: schedule retry in 1 hour
     if lead_status == "CALLBACK":
         await schedule_callback_retry(phone_number_id, delay_seconds=3600)
-        logger.info("Scheduled callback retry for phone_number_id=%s", phone_number_id)
 
-    # Handle INTERESTED: log for WhatsApp alert (insert to whatsapp_alerts table)
     if lead_status == "INTERESTED":
         try:
             pn_resp = (
@@ -333,25 +460,20 @@ async def exotel_call_completed(
                 .execute()
             )
             customer_number = pn_resp.data["number"] if pn_resp.data else "unknown"
-
-            supabase_admin.table("whatsapp_alerts").insert(
-                {
-                    "id": str(uuid.uuid4()),
-                    "client_id": client_id,
-                    "campaign_id": campaign_id,
-                    "call_id": call_id,
-                    "phone_number": customer_number,
-                    "lead_status": lead_status,
-                    "ai_summary": ai_summary,
-                    "created_at": now,
-                    "sent": False,
-                }
-            ).execute()
-            logger.info("WhatsApp alert logged for INTERESTED lead: %s", customer_number)
+            supabase_admin.table("whatsapp_alerts").insert({
+                "id": str(uuid.uuid4()),
+                "client_id": client_id,
+                "campaign_id": campaign_id,
+                "call_id": call_id,
+                "phone_number": customer_number,
+                "lead_status": lead_status,
+                "ai_summary": ai_summary,
+                "created_at": now,
+                "sent": False,
+            }).execute()
         except Exception as exc:
-            logger.error("Failed to log WhatsApp alert for call %s: %s", call_id, exc)
+            logger.error("WhatsApp alert log failed for call %s: %s", call_id, exc)
 
-    # Handle WRONG_NUMBER or repeated NOT_INTERESTED: blacklist
     if lead_status == "WRONG_NUMBER":
         try:
             pn_resp = (
@@ -365,20 +487,40 @@ async def exotel_call_completed(
                 await add_to_blacklist(
                     client_id=client_id,
                     phone_number=pn_resp.data["number"],
-                    reason="Wrong number — reported during call",
+                    reason="Wrong number reported during call",
                 )
         except Exception as exc:
-            logger.error("Failed to blacklist wrong number for call %s: %s", call_id, exc)
+            logger.error("Blacklist insert failed for call %s: %s", call_id, exc)
 
     logger.info(
-        "Call %s completed: status=%s, duration=%ds, cost=%d paise, lead_status=%s",
-        call_id,
-        final_status,
-        duration_seconds,
-        cost_paise,
-        lead_status,
+        "Call %s done: status=%s duration=%ds cost=%d paise lead=%s",
+        call_id, final_status, duration_seconds, cost_paise, lead_status,
     )
+    return JSONResponse(content={"ok": True})
 
+
+# ---------------------------------------------------------------------------
+# Twilio: Recording Status Callback
+# ---------------------------------------------------------------------------
+
+@router.post("/twilio/recording")
+async def twilio_recording(
+    CallSid: str = Form(...),
+    RecordingUrl: Optional[str] = Form(None),
+    RecordingStatus: Optional[str] = Form(None),
+) -> JSONResponse:
+    """Store the Twilio recording URL once transcription is complete."""
+    if RecordingStatus != "completed" or not RecordingUrl:
+        return JSONResponse(content={"ok": True})
+
+    # Twilio recording URLs need .mp3 appended
+    recording_url = f"{RecordingUrl}.mp3"
+
+    supabase_admin.table("calls").update({
+        "recording_url": recording_url,
+    }).eq("call_sid", CallSid).execute()
+
+    logger.info("Recording saved for CallSid=%s: %s", CallSid, recording_url)
     return JSONResponse(content={"ok": True})
 
 
@@ -391,67 +533,43 @@ async def razorpay_payment_webhook(
     request: Request,
     x_razorpay_signature: Optional[str] = Header(None),
 ) -> JSONResponse:
-    """
-    Handle Razorpay payment webhooks.
-
-    Verifies the webhook signature and credits the client wallet on
-    payment.captured events.
-    """
+    """Verify Razorpay webhook signature and credit wallet on payment.captured."""
     raw_body = await request.body()
 
     if not x_razorpay_signature:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Missing X-Razorpay-Signature header",
-        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing signature")
 
-    # Verify signature
-    webhook_secret = settings.razorpay_key_secret
     expected = hmac.new(
-        key=webhook_secret.encode("utf-8"),
+        key=settings.razorpay_key_secret.encode("utf-8"),
         msg=raw_body,
         digestmod=hashlib.sha256,
     ).hexdigest()
 
     if not hmac.compare_digest(expected, x_razorpay_signature):
-        logger.warning("Invalid Razorpay webhook signature")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid webhook signature",
-        )
-
-    import json
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid signature")
 
     payload = json.loads(raw_body)
     event: str = payload.get("event", "")
 
     if event != "payment.captured":
-        # Acknowledge events we don't handle
         return JSONResponse(content={"ok": True, "event": event})
 
     payment_entity = payload["payload"]["payment"]["entity"]
     payment_id: str = payment_entity["id"]
     order_id: str = payment_entity.get("order_id", "")
     amount_paise: int = int(payment_entity["amount"])
-    payment_notes: dict = payment_entity.get("notes", {})
-    client_id: str = payment_notes.get("client_id", "")
+    client_id: str = payment_entity.get("notes", {}).get("client_id", "")
 
     if not client_id:
-        # Try to look up by order_id via pending topup records
-        logger.warning("payment.captured has no client_id in notes; order_id=%s", order_id)
-        return JSONResponse(content={"ok": False, "detail": "client_id not found in notes"})
+        logger.warning("payment.captured missing client_id in notes; order_id=%s", order_id)
+        return JSONResponse(content={"ok": False, "detail": "client_id not found"})
 
     await wallet_manager.credit(
         client_id=client_id,
         amount_paise=amount_paise,
         razorpay_payment_id=payment_id,
-        description=f"Wallet top-up via Razorpay webhook (payment: {payment_id})",
+        description=f"Wallet top-up via Razorpay (payment: {payment_id})",
     )
 
-    logger.info(
-        "Razorpay webhook: credited %d paise to client %s (payment=%s)",
-        amount_paise,
-        client_id,
-        payment_id,
-    )
+    logger.info("Credited %d paise to client %s (payment=%s)", amount_paise, client_id, payment_id)
     return JSONResponse(content={"ok": True})

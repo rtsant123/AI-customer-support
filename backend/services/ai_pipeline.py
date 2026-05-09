@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import audioop
+import io
 import json
 import logging
+import struct
 import uuid
+import wave
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -54,6 +58,32 @@ END_OF_CALL_MARKERS = frozenset(
 _anthropic_client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
 
 
+# ---------------------------------------------------------------------------
+# Audio format helpers (mulaw ↔ PCM ↔ WAV)
+# Twilio Media Streams use mulaw 8kHz; Sarvam AI expects WAV.
+# ---------------------------------------------------------------------------
+
+def mulaw_to_pcm(mulaw_data: bytes) -> bytes:
+    """Convert mulaw encoded bytes to 16-bit little-endian PCM."""
+    return audioop.ulaw2lin(mulaw_data, 2)
+
+
+def pcm_to_mulaw(pcm_data: bytes) -> bytes:
+    """Convert 16-bit little-endian PCM to mulaw encoded bytes."""
+    return audioop.lin2ulaw(pcm_data, 2)
+
+
+def pcm_to_wav(pcm_data: bytes, sample_rate: int = 8000, channels: int = 1) -> bytes:
+    """Wrap raw 16-bit PCM in a WAV container."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(2)  # 16-bit
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_data)
+    return buf.getvalue()
+
+
 def _get_redis():
     """Import redis_client lazily to avoid circular import at module load time."""
     from main import redis_client
@@ -76,10 +106,12 @@ class AIConversation:
         campaign_id: str,
         phone_number_id: str,
         client_id: str,
+        agent_gender: str = "female",
     ) -> None:
         self.call_sid = call_sid
         self.system_prompt = system_prompt
         self.language = language
+        self.agent_gender = agent_gender
         self.campaign_id = campaign_id
         self.phone_number_id = phone_number_id
         self.client_id = client_id
@@ -98,6 +130,7 @@ class AIConversation:
             "call_sid": self.call_sid,
             "system_prompt": self.system_prompt,
             "language": self.language,
+            "agent_gender": self.agent_gender,
             "campaign_id": self.campaign_id,
             "phone_number_id": self.phone_number_id,
             "client_id": self.client_id,
@@ -126,6 +159,7 @@ class AIConversation:
             call_sid=state["call_sid"],
             system_prompt=state["system_prompt"],
             language=state["language"],
+            agent_gender=state.get("agent_gender", "female"),
             campaign_id=state["campaign_id"],
             phone_number_id=state["phone_number_id"],
             client_id=state["client_id"],
@@ -168,20 +202,11 @@ class AIConversation:
             logger.debug("STT result: %r", transcript[:100])
             return transcript
 
-    async def _tts(self, text: str, gender: str = "female") -> bytes:
-        """
-        Convert text to audio using Sarvam AI TTS.
-
-        Args:
-            text: Text to synthesize.
-            gender: "male" or "female" speaker voice.
-
-        Returns:
-            Audio bytes (WAV format).
-        """
+    async def _tts(self, text: str) -> bytes:
+        """Convert text to audio using Sarvam AI TTS. Returns WAV bytes at 8kHz."""
         lang_code = _LANGUAGE_CODES.get(self.language, "hi-IN")
         speakers = _TTS_SPEAKERS.get(self.language, _TTS_SPEAKERS["english"])
-        speaker = speakers.get(gender, speakers["female"])
+        speaker = speakers.get(self.agent_gender, speakers["female"])
 
         async with httpx.AsyncClient(timeout=SARVAM_TIMEOUT) as client:
             response = await client.post(
@@ -283,7 +308,6 @@ class AIConversation:
         else:
             spoken_text = agent_response.strip()
 
-        # Step 5: TTS
         audio_response = await self._tts(spoken_text)
 
         # Step 6: Save state
@@ -383,26 +407,14 @@ async def start_conversation(
     phone_number_id: str,
     client_id: str,
     call_id: str,
+    agent_gender: str = "female",
 ) -> AIConversation:
-    """
-    Initialise and persist a new AIConversation for a just-connected call.
-
-    Args:
-        call_sid: Exotel CallSid.
-        system_prompt: Pre-built prompt from prompt_builder.
-        language: Campaign language key.
-        campaign_id: UUID.
-        phone_number_id: UUID.
-        client_id: UUID.
-        call_id: UUID of the call record in DB.
-
-    Returns:
-        The newly created AIConversation instance.
-    """
+    """Initialise and persist a new AIConversation for a just-connected call."""
     conv = AIConversation(
         call_sid=call_sid,
         system_prompt=system_prompt,
         language=language,
+        agent_gender=agent_gender,
         campaign_id=campaign_id,
         phone_number_id=phone_number_id,
         client_id=client_id,

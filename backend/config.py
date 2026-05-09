@@ -8,11 +8,11 @@ class Settings(BaseSettings):
     supabase_service_key: str
     supabase_anon_key: str
 
-    # Exotel
-    exotel_api_key: str
-    exotel_api_token: str
-    exotel_sid: str
-    exotel_caller_id: str
+    # Twilio
+    twilio_account_sid: str
+    twilio_auth_token: str
+    twilio_phone_number: str  # E.164, e.g. +918XXXXXXXXX
+    backend_url: str  # Public URL of this server, e.g. https://your-app.railway.app
 
     # Sarvam AI
     sarvam_api_key: str
