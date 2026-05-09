@@ -10,8 +10,11 @@ from typing import Optional
 import phonenumbers
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import JSONResponse
+from sqlalchemy import select, update, and_, func
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from database import supabase_admin
+from database import get_db
+from models import Campaign, PhoneNumber, Client
 from models.schemas import (
     CampaignCreate,
     CampaignStats,
@@ -50,12 +53,50 @@ def _normalize_phone(raw: str) -> Optional[str]:
     return None
 
 
-def _assert_campaign_belongs_to_client(campaign: Optional[dict], campaign_id: str, client_id: str) -> dict:
+def _assert_campaign_belongs_to_client(campaign: Optional[Campaign], campaign_id: str, client_id) -> Campaign:
     if not campaign:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Campaign not found")
-    if campaign["client_id"] != client_id:
+    if str(campaign.client_id) != str(client_id):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
     return campaign
+
+
+def _campaign_dict(c: Campaign) -> dict:
+    return {
+        "id": str(c.id),
+        "client_id": str(c.client_id),
+        "name": c.name,
+        "status": c.status,
+        "language": c.language,
+        "agent_name": c.agent_name,
+        "agent_gender": c.agent_gender,
+        "agent_tone": c.agent_tone,
+        "company_name": c.company_name,
+        "product_name": c.product_name,
+        "product_price": c.product_price,
+        "key_benefits": c.key_benefits or [],
+        "goal": c.goal,
+        "transfer_condition": c.transfer_condition,
+        "system_prompt": c.system_prompt,
+        "calling_schedule_start": c.calling_schedule_start,
+        "calling_schedule_end": c.calling_schedule_end,
+        "calling_days": c.calling_days or [],
+        "created_at": c.created_at.isoformat() if c.created_at else None,
+    }
+
+
+def _phone_number_dict(p: PhoneNumber) -> dict:
+    return {
+        "id": str(p.id),
+        "campaign_id": str(p.campaign_id),
+        "client_id": str(p.client_id),
+        "number": p.number,
+        "status": p.status,
+        "attempts": p.attempts,
+        "last_attempt_at": p.last_attempt_at.isoformat() if p.last_attempt_at else None,
+        "callback_datetime": p.callback_datetime.isoformat() if p.callback_datetime else None,
+        "created_at": p.created_at.isoformat() if p.created_at else None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -63,45 +104,43 @@ def _assert_campaign_belongs_to_client(campaign: Optional[dict], campaign_id: st
 # ---------------------------------------------------------------------------
 
 @router.get("")
-async def list_campaigns(current_user: dict = Depends(get_current_user)) -> JSONResponse:
+async def list_campaigns(
+    current_user: Client = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> JSONResponse:
     """Return all campaigns belonging to the current client."""
-    response = (
-        supabase_admin.table("campaigns")
-        .select("*")
-        .eq("client_id", current_user["id"])
-        .eq("is_deleted", False)
-        .order("created_at", desc=True)
-        .execute()
+    result = await db.execute(
+        select(Campaign)
+        .where(Campaign.client_id == current_user.id)
+        .where(Campaign.status != "deleted")
+        .order_by(Campaign.created_at.desc())
     )
-    return JSONResponse(content={"campaigns": response.data or []})
+    campaigns = result.scalars().all()
+    return JSONResponse(content={"campaigns": [_campaign_dict(c) for c in campaigns]})
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_campaign(
     body: CampaignCreate,
-    current_user: dict = Depends(get_current_user),
+    current_user: Client = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ) -> JSONResponse:
     """Create a new campaign and auto-generate its system prompt."""
-    campaign_id = str(uuid.uuid4())
-    now = datetime.now(timezone.utc).isoformat()
-
     campaign_data = body.model_dump()
     system_prompt = build_system_prompt(campaign_data)
 
-    record = {
-        "id": campaign_id,
-        "client_id": current_user["id"],
-        "status": "draft",
-        "system_prompt": system_prompt,
-        "is_deleted": False,
-        "created_at": now,
+    campaign = Campaign(
+        client_id=current_user.id,
+        status="draft",
+        system_prompt=system_prompt,
         **campaign_data,
-    }
+    )
+    db.add(campaign)
+    await db.commit()
+    await db.refresh(campaign)
+    logger.info("Created campaign %s for client %s", campaign.id, current_user.id)
 
-    supabase_admin.table("campaigns").insert(record).execute()
-    logger.info("Created campaign %s for client %s", campaign_id, current_user["id"])
-
-    return JSONResponse(status_code=status.HTTP_201_CREATED, content={"campaign": record})
+    return JSONResponse(status_code=status.HTTP_201_CREATED, content={"campaign": _campaign_dict(campaign)})
 
 
 # ---------------------------------------------------------------------------
@@ -111,46 +150,42 @@ async def create_campaign(
 @router.get("/{campaign_id}")
 async def get_campaign(
     campaign_id: str,
-    current_user: dict = Depends(get_current_user),
+    current_user: Client = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ) -> JSONResponse:
-    response = (
-        supabase_admin.table("campaigns")
-        .select("*")
-        .eq("id", campaign_id)
-        .eq("is_deleted", False)
-        .single()
-        .execute()
+    result = await db.execute(
+        select(Campaign)
+        .where(Campaign.id == uuid.UUID(campaign_id))
+        .where(Campaign.status != "deleted")
     )
-    campaign = _assert_campaign_belongs_to_client(response.data, campaign_id, current_user["id"])
-    return JSONResponse(content={"campaign": campaign})
+    campaign = _assert_campaign_belongs_to_client(result.scalar_one_or_none(), campaign_id, current_user.id)
+    return JSONResponse(content={"campaign": _campaign_dict(campaign)})
 
 
 @router.put("/{campaign_id}")
 async def update_campaign(
     campaign_id: str,
     body: CampaignUpdate,
-    current_user: dict = Depends(get_current_user),
+    current_user: Client = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ) -> JSONResponse:
     """Update a campaign. Only allowed when status is draft or paused."""
-    existing_resp = (
-        supabase_admin.table("campaigns")
-        .select("*")
-        .eq("id", campaign_id)
-        .eq("is_deleted", False)
-        .single()
-        .execute()
+    result = await db.execute(
+        select(Campaign)
+        .where(Campaign.id == uuid.UUID(campaign_id))
+        .where(Campaign.status != "deleted")
     )
-    campaign = _assert_campaign_belongs_to_client(existing_resp.data, campaign_id, current_user["id"])
+    campaign = _assert_campaign_belongs_to_client(result.scalar_one_or_none(), campaign_id, current_user.id)
 
-    if campaign["status"] not in EDITABLE_STATUSES:
+    if campaign.status not in EDITABLE_STATUSES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot edit campaign with status '{campaign['status']}'. Pause it first.",
+            detail=f"Cannot edit campaign with status '{campaign.status}'. Pause it first.",
         )
 
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
     if not updates:
-        return JSONResponse(content={"campaign": campaign})
+        return JSONResponse(content={"campaign": _campaign_dict(campaign)})
 
     # If any prompt-affecting field changed, rebuild the system prompt
     prompt_fields = {
@@ -158,34 +193,44 @@ async def update_campaign(
         "product_name", "product_price", "key_benefits", "goal", "transfer_condition",
     }
     if prompt_fields & set(updates.keys()):
-        merged = {**campaign, **updates}
+        # Build merged dict from current campaign + updates
+        current_data = _campaign_dict(campaign)
+        merged = {**current_data, **updates}
         updates["system_prompt"] = build_system_prompt(merged)
 
-    supabase_admin.table("campaigns").update(updates).eq("id", campaign_id).execute()
-
-    refreshed = (
-        supabase_admin.table("campaigns").select("*").eq("id", campaign_id).single().execute()
+    await db.execute(
+        update(Campaign)
+        .where(Campaign.id == uuid.UUID(campaign_id))
+        .values(**updates)
     )
-    return JSONResponse(content={"campaign": refreshed.data})
+    await db.commit()
+
+    # Refresh and return
+    refreshed_result = await db.execute(select(Campaign).where(Campaign.id == uuid.UUID(campaign_id)))
+    refreshed = refreshed_result.scalar_one()
+    return JSONResponse(content={"campaign": _campaign_dict(refreshed)})
 
 
 @router.delete("/{campaign_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_campaign(
     campaign_id: str,
-    current_user: dict = Depends(get_current_user),
+    current_user: Client = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ) -> None:
-    """Soft-delete a campaign."""
-    existing_resp = (
-        supabase_admin.table("campaigns")
-        .select("id, client_id")
-        .eq("id", campaign_id)
-        .eq("is_deleted", False)
-        .single()
-        .execute()
+    """Soft-delete a campaign by setting status to 'deleted'."""
+    result = await db.execute(
+        select(Campaign)
+        .where(Campaign.id == uuid.UUID(campaign_id))
+        .where(Campaign.status != "deleted")
     )
-    _assert_campaign_belongs_to_client(existing_resp.data, campaign_id, current_user["id"])
+    _assert_campaign_belongs_to_client(result.scalar_one_or_none(), campaign_id, current_user.id)
 
-    supabase_admin.table("campaigns").update({"is_deleted": True}).eq("id", campaign_id).execute()
+    await db.execute(
+        update(Campaign)
+        .where(Campaign.id == uuid.UUID(campaign_id))
+        .values(status="deleted")
+    )
+    await db.commit()
     logger.info("Soft-deleted campaign %s", campaign_id)
 
 
@@ -196,34 +241,30 @@ async def delete_campaign(
 @router.post("/{campaign_id}/launch")
 async def launch_campaign(
     campaign_id: str,
-    current_user: dict = Depends(get_current_user),
+    current_user: Client = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ) -> JSONResponse:
     """Launch a draft/paused campaign: set active and enqueue pending numbers."""
-    existing_resp = (
-        supabase_admin.table("campaigns")
-        .select("*")
-        .eq("id", campaign_id)
-        .eq("is_deleted", False)
-        .single()
-        .execute()
+    result = await db.execute(
+        select(Campaign)
+        .where(Campaign.id == uuid.UUID(campaign_id))
+        .where(Campaign.status != "deleted")
     )
-    campaign = _assert_campaign_belongs_to_client(existing_resp.data, campaign_id, current_user["id"])
+    campaign = _assert_campaign_belongs_to_client(result.scalar_one_or_none(), campaign_id, current_user.id)
 
-    if campaign["status"] == "active":
+    if campaign.status == "active":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Campaign is already active",
         )
 
     # Fetch all pending numbers
-    numbers_resp = (
-        supabase_admin.table("phone_numbers")
-        .select("id, number")
-        .eq("campaign_id", campaign_id)
-        .eq("status", "pending")
-        .execute()
+    numbers_result = await db.execute(
+        select(PhoneNumber)
+        .where(PhoneNumber.campaign_id == uuid.UUID(campaign_id))
+        .where(PhoneNumber.status == "pending")
     )
-    pending = numbers_resp.data or []
+    pending = numbers_result.scalars().all()
 
     if not pending:
         raise HTTPException(
@@ -231,10 +272,15 @@ async def launch_campaign(
             detail="No pending numbers to call. Upload phone numbers first.",
         )
 
-    phone_number_ids = [row["id"] for row in pending]
+    phone_number_ids = [str(row.id) for row in pending]
     await enqueue_campaign_calls(campaign_id, phone_number_ids)
 
-    supabase_admin.table("campaigns").update({"status": "active"}).eq("id", campaign_id).execute()
+    await db.execute(
+        update(Campaign)
+        .where(Campaign.id == uuid.UUID(campaign_id))
+        .values(status="active")
+    )
+    await db.commit()
     logger.info("Launched campaign %s with %d numbers", campaign_id, len(pending))
 
     return JSONResponse(content={"status": "active", "enqueued": len(pending)})
@@ -243,27 +289,30 @@ async def launch_campaign(
 @router.post("/{campaign_id}/pause")
 async def pause_campaign(
     campaign_id: str,
-    current_user: dict = Depends(get_current_user),
+    current_user: Client = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ) -> JSONResponse:
     """Pause an active campaign."""
-    existing_resp = (
-        supabase_admin.table("campaigns")
-        .select("id, client_id, status")
-        .eq("id", campaign_id)
-        .eq("is_deleted", False)
-        .single()
-        .execute()
+    result = await db.execute(
+        select(Campaign)
+        .where(Campaign.id == uuid.UUID(campaign_id))
+        .where(Campaign.status != "deleted")
     )
-    campaign = _assert_campaign_belongs_to_client(existing_resp.data, campaign_id, current_user["id"])
+    campaign = _assert_campaign_belongs_to_client(result.scalar_one_or_none(), campaign_id, current_user.id)
 
-    if campaign["status"] != "active":
+    if campaign.status != "active":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Campaign is not active",
         )
 
     await pause_campaign_queue(campaign_id)
-    supabase_admin.table("campaigns").update({"status": "paused"}).eq("id", campaign_id).execute()
+    await db.execute(
+        update(Campaign)
+        .where(Campaign.id == uuid.UUID(campaign_id))
+        .values(status="paused")
+    )
+    await db.commit()
     logger.info("Paused campaign %s", campaign_id)
 
     return JSONResponse(content={"status": "paused"})
@@ -272,27 +321,30 @@ async def pause_campaign(
 @router.post("/{campaign_id}/resume")
 async def resume_campaign(
     campaign_id: str,
-    current_user: dict = Depends(get_current_user),
+    current_user: Client = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ) -> JSONResponse:
     """Resume a paused campaign."""
-    existing_resp = (
-        supabase_admin.table("campaigns")
-        .select("id, client_id, status")
-        .eq("id", campaign_id)
-        .eq("is_deleted", False)
-        .single()
-        .execute()
+    result = await db.execute(
+        select(Campaign)
+        .where(Campaign.id == uuid.UUID(campaign_id))
+        .where(Campaign.status != "deleted")
     )
-    campaign = _assert_campaign_belongs_to_client(existing_resp.data, campaign_id, current_user["id"])
+    campaign = _assert_campaign_belongs_to_client(result.scalar_one_or_none(), campaign_id, current_user.id)
 
-    if campaign["status"] != "paused":
+    if campaign.status != "paused":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Campaign is not paused",
         )
 
     await resume_campaign_queue(campaign_id)
-    supabase_admin.table("campaigns").update({"status": "active"}).eq("id", campaign_id).execute()
+    await db.execute(
+        update(Campaign)
+        .where(Campaign.id == uuid.UUID(campaign_id))
+        .values(status="active")
+    )
+    await db.commit()
     logger.info("Resumed campaign %s", campaign_id)
 
     return JSONResponse(content={"status": "active"})
@@ -306,22 +358,20 @@ async def resume_campaign(
 async def upload_numbers(
     campaign_id: str,
     body: PhoneNumberUpload,
-    current_user: dict = Depends(get_current_user),
+    current_user: Client = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ) -> JSONResponse:
     """
     Upload phone numbers to a campaign.
 
     Validates format, deduplicates, filters DND/blacklist, and inserts.
     """
-    existing_resp = (
-        supabase_admin.table("campaigns")
-        .select("id, client_id")
-        .eq("id", campaign_id)
-        .eq("is_deleted", False)
-        .single()
-        .execute()
+    result = await db.execute(
+        select(Campaign)
+        .where(Campaign.id == uuid.UUID(campaign_id))
+        .where(Campaign.status != "deleted")
     )
-    _assert_campaign_belongs_to_client(existing_resp.data, campaign_id, current_user["id"])
+    _assert_campaign_belongs_to_client(result.scalar_one_or_none(), campaign_id, current_user.id)
 
     # Normalize and validate
     normalized: list[str] = []
@@ -342,35 +392,31 @@ async def upload_numbers(
             unique.append(n)
 
     # Filter existing numbers already in this campaign
-    existing_numbers_resp = (
-        supabase_admin.table("phone_numbers")
-        .select("number")
-        .eq("campaign_id", campaign_id)
-        .execute()
+    existing_result = await db.execute(
+        select(PhoneNumber.number)
+        .where(PhoneNumber.campaign_id == uuid.UUID(campaign_id))
     )
-    existing_set = {row["number"] for row in (existing_numbers_resp.data or [])}
+    existing_set = {row[0] for row in existing_result.all()}
     new_numbers = [n for n in unique if n not in existing_set]
 
     # DND filter
-    clean_numbers, blocked_numbers = await filter_dnd_numbers(new_numbers, current_user["id"])
+    clean_numbers, blocked_numbers = await filter_dnd_numbers(db, new_numbers, current_user.id)
 
     # Batch insert clean numbers
-    now = datetime.now(timezone.utc).isoformat()
     records = [
-        {
-            "id": str(uuid.uuid4()),
-            "campaign_id": campaign_id,
-            "client_id": current_user["id"],
-            "number": num,
-            "status": "pending",
-            "attempts": 0,
-            "created_at": now,
-        }
+        PhoneNumber(
+            campaign_id=uuid.UUID(campaign_id),
+            client_id=current_user.id,
+            number=num,
+            status="pending",
+            attempts=0,
+        )
         for num in clean_numbers
     ]
 
     if records:
-        supabase_admin.table("phone_numbers").insert(records).execute()
+        db.add_all(records)
+        await db.commit()
 
     logger.info(
         "Uploaded %d numbers to campaign %s: %d clean, %d blocked, %d invalid, %d duplicate",
@@ -398,32 +444,30 @@ async def list_numbers(
     campaign_id: str,
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
-    current_user: dict = Depends(get_current_user),
+    current_user: Client = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ) -> JSONResponse:
     """List phone numbers for a campaign with pagination."""
-    existing_resp = (
-        supabase_admin.table("campaigns")
-        .select("id, client_id")
-        .eq("id", campaign_id)
-        .eq("is_deleted", False)
-        .single()
-        .execute()
+    result = await db.execute(
+        select(Campaign)
+        .where(Campaign.id == uuid.UUID(campaign_id))
+        .where(Campaign.status != "deleted")
     )
-    _assert_campaign_belongs_to_client(existing_resp.data, campaign_id, current_user["id"])
+    _assert_campaign_belongs_to_client(result.scalar_one_or_none(), campaign_id, current_user.id)
 
     offset = (page - 1) * page_size
-    numbers_resp = (
-        supabase_admin.table("phone_numbers")
-        .select("*")
-        .eq("campaign_id", campaign_id)
-        .order("created_at", desc=False)
-        .range(offset, offset + page_size - 1)
-        .execute()
+    numbers_result = await db.execute(
+        select(PhoneNumber)
+        .where(PhoneNumber.campaign_id == uuid.UUID(campaign_id))
+        .order_by(PhoneNumber.created_at.asc())
+        .offset(offset)
+        .limit(page_size)
     )
+    numbers = numbers_result.scalars().all()
 
     return JSONResponse(
         content={
-            "numbers": numbers_resp.data or [],
+            "numbers": [_phone_number_dict(p) for p in numbers],
             "page": page,
             "page_size": page_size,
         }
@@ -433,26 +477,22 @@ async def list_numbers(
 @router.get("/{campaign_id}/stats")
 async def campaign_stats(
     campaign_id: str,
-    current_user: dict = Depends(get_current_user),
+    current_user: Client = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ) -> JSONResponse:
     """Return aggregate call outcome statistics for a campaign."""
-    existing_resp = (
-        supabase_admin.table("campaigns")
-        .select("id, client_id")
-        .eq("id", campaign_id)
-        .eq("is_deleted", False)
-        .single()
-        .execute()
+    result = await db.execute(
+        select(Campaign)
+        .where(Campaign.id == uuid.UUID(campaign_id))
+        .where(Campaign.status != "deleted")
     )
-    _assert_campaign_belongs_to_client(existing_resp.data, campaign_id, current_user["id"])
+    _assert_campaign_belongs_to_client(result.scalar_one_or_none(), campaign_id, current_user.id)
 
-    numbers_resp = (
-        supabase_admin.table("phone_numbers")
-        .select("status, lead_status")
-        .eq("campaign_id", campaign_id)
-        .execute()
+    numbers_result = await db.execute(
+        select(PhoneNumber.status, PhoneNumber.callback_datetime)
+        .where(PhoneNumber.campaign_id == uuid.UUID(campaign_id))
     )
-    rows = numbers_resp.data or []
+    rows = numbers_result.all()
 
     stats: dict[str, int] = {
         "total": len(rows),
@@ -467,23 +507,27 @@ async def campaign_stats(
     }
 
     for row in rows:
-        s = row.get("status", "pending")
-        ls = (row.get("lead_status") or "").lower().replace(" ", "_")
+        s = (row[0] or "pending").lower()
 
         if s == "pending":
             stats["pending"] += 1
         elif s == "called":
             stats["called"] += 1
-            if ls == "interested":
-                stats["interested"] += 1
-            elif ls == "not_interested":
-                stats["not_interested"] += 1
-            elif ls == "callback":
-                stats["callback"] += 1
-            elif ls == "wrong_number":
-                stats["wrong_number"] += 1
-            elif ls == "language_barrier":
-                stats["language_barrier"] += 1
+        elif s == "interested":
+            stats["called"] += 1
+            stats["interested"] += 1
+        elif s == "not_interested":
+            stats["called"] += 1
+            stats["not_interested"] += 1
+        elif s == "callback":
+            stats["called"] += 1
+            stats["callback"] += 1
+        elif s == "wrong_number":
+            stats["called"] += 1
+            stats["wrong_number"] += 1
+        elif s == "language_barrier":
+            stats["called"] += 1
+            stats["language_barrier"] += 1
         elif s == "dnd_blocked":
             stats["dnd_blocked"] += 1
 

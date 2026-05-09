@@ -1,197 +1,117 @@
-"""Authentication routes: signup, login, and current-user dependency."""
-
 from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from fastapi.responses import JSONResponse
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from database import supabase_admin, supabase_anon
-from models.schemas import AuthResponse, LoginRequest, SignupRequest
+from config import settings
+from database import get_db
+from models import Client
+from models.schemas import LoginRequest, SignupRequest
 
 logger = logging.getLogger(__name__)
-
 router = APIRouter(prefix="/auth", tags=["auth"])
 
+_pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+_ALGORITHM = "HS256"
 
-# ---------------------------------------------------------------------------
-# Dependency: resolve the current authenticated client
-# ---------------------------------------------------------------------------
 
-async def get_current_user(authorization: str = Header(...)) -> dict:
-    """
-    Validate the Supabase JWT from the Authorization header.
+def hash_password(password: str) -> str:
+    return _pwd_context.hash(password)
 
-    Expects: Authorization: Bearer <access_token>
 
-    Returns:
-        The client record from the clients table.
+def verify_password(plain: str, hashed: str) -> bool:
+    return _pwd_context.verify(plain, hashed)
 
-    Raises:
-        HTTPException 401 if the token is missing, invalid, or the client record
-        cannot be found.
-    """
+
+def create_access_token(user_id: str, email: str) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(days=settings.jwt_expire_days)
+    return jwt.encode(
+        {"sub": user_id, "email": email, "exp": expire},
+        settings.secret_key,
+        algorithm=_ALGORITHM,
+    )
+
+
+async def get_current_user(
+    authorization: str = Header(...),
+    db: AsyncSession = Depends(get_db),
+) -> Client:
     if not authorization.startswith("Bearer "):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authorization header format. Expected: Bearer <token>",
-        )
-
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authorization header")
     token = authorization.removeprefix("Bearer ").strip()
-    if not token:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing access token",
-        )
-
     try:
-        user_response = supabase_admin.auth.get_user(token)
-        auth_user = user_response.user
-        if auth_user is None:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid or expired token",
-            )
-    except Exception as exc:
-        logger.warning("Token validation failed: %s", exc)
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired token",
-        ) from exc
+        payload = jwt.decode(token, settings.secret_key, algorithms=[_ALGORITHM])
+        user_id: str = payload.get("sub", "")
+    except JWTError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
 
-    client_response = (
-        supabase_admin.table("clients")
-        .select("*")
-        .eq("user_id", auth_user.id)
-        .single()
-        .execute()
+    result = await db.execute(select(Client).where(Client.id == uuid.UUID(user_id)))
+    client = result.scalar_one_or_none()
+    if not client or not client.is_active:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+    return client
+
+
+@router.post("/signup", status_code=status.HTTP_201_CREATED)
+async def signup(body: SignupRequest, db: AsyncSession = Depends(get_db)) -> JSONResponse:
+    existing = await db.execute(select(Client).where(Client.email == body.email))
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email already registered")
+
+    client = Client(
+        email=body.email,
+        password_hash=hash_password(body.password),
+        company_name=body.company_name,
     )
-    if not client_response.data:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Client account not found",
-        )
+    db.add(client)
+    await db.commit()
+    await db.refresh(client)
 
-    return client_response.data
-
-
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
-
-@router.post("/signup", response_model=AuthResponse, status_code=status.HTTP_201_CREATED)
-async def signup(body: SignupRequest) -> JSONResponse:
-    """Create a new Supabase Auth user and a corresponding client record."""
-    try:
-        auth_response = supabase_admin.auth.admin.create_user(
-            {
-                "email": body.email,
-                "password": body.password,
-                "email_confirm": True,
-            }
-        )
-    except Exception as exc:
-        logger.error("Supabase auth signup failed: %s", exc)
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Signup failed: {exc}",
-        ) from exc
-
-    auth_user = auth_response.user
-    if auth_user is None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="User creation returned no user object",
-        )
-
-    client_id = str(uuid.uuid4())
-    now = datetime.now(timezone.utc).isoformat()
-
-    supabase_admin.table("clients").insert(
-        {
-            "id": client_id,
-            "user_id": auth_user.id,
-            "email": body.email,
-            "company_name": body.company_name,
-            "balance_paise": 0,
-            "created_at": now,
-        }
-    ).execute()
-
-    # Sign in to get a JWT for the response
-    sign_in = supabase_anon.auth.sign_in_with_password(
-        {"email": body.email, "password": body.password}
-    )
-
+    token = create_access_token(str(client.id), client.email)
     return JSONResponse(
-        status_code=status.HTTP_201_CREATED,
+        status_code=201,
         content={
-            "access_token": sign_in.session.access_token,
-            "user_id": client_id,
-            "email": body.email,
-            "company_name": body.company_name,
+            "access_token": token,
+            "user_id": str(client.id),
+            "email": client.email,
+            "company_name": client.company_name,
         },
     )
 
 
-@router.post("/login", response_model=AuthResponse)
-async def login(body: LoginRequest) -> JSONResponse:
-    """Authenticate with Supabase and return a JWT."""
-    try:
-        sign_in = supabase_anon.auth.sign_in_with_password(
-            {"email": body.email, "password": body.password}
-        )
-    except Exception as exc:
-        logger.warning("Login failed for %s: %s", body.email, exc)
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password",
-        ) from exc
+@router.post("/login")
+async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)) -> JSONResponse:
+    result = await db.execute(select(Client).where(Client.email == body.email))
+    client = result.scalar_one_or_none()
+    if not client or not verify_password(body.password, client.password_hash):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
+    if not client.is_active:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is inactive")
 
-    if sign_in.session is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password",
-        )
-
-    auth_user = sign_in.user
-    client_response = (
-        supabase_admin.table("clients")
-        .select("id, company_name")
-        .eq("user_id", auth_user.id)
-        .single()
-        .execute()
-    )
-    if not client_response.data:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Client record not found",
-        )
-
-    client = client_response.data
-
-    return JSONResponse(
-        content={
-            "access_token": sign_in.session.access_token,
-            "user_id": client["id"],
-            "email": auth_user.email,
-            "company_name": client["company_name"],
-        }
-    )
+    token = create_access_token(str(client.id), client.email)
+    return JSONResponse(content={
+        "access_token": token,
+        "user_id": str(client.id),
+        "email": client.email,
+        "company_name": client.company_name,
+    })
 
 
 @router.get("/me")
-async def get_me(current_user: dict = Depends(get_current_user)) -> JSONResponse:
-    """Return the current authenticated client's profile."""
-    return JSONResponse(
-        content={
-            "id": current_user["id"],
-            "email": current_user["email"],
-            "company_name": current_user["company_name"],
-            "balance_paise": current_user.get("balance_paise", 0),
-            "created_at": str(current_user.get("created_at", "")),
-        }
-    )
+async def get_me(current_user: Client = Depends(get_current_user)) -> JSONResponse:
+    return JSONResponse(content={
+        "id": str(current_user.id),
+        "email": current_user.email,
+        "company_name": current_user.company_name,
+        "wallet_balance": current_user.wallet_balance,
+        "is_admin": current_user.is_admin,
+        "created_at": current_user.created_at.isoformat(),
+    })

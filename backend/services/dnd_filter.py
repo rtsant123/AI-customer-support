@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import logging
-import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 
 import pytz
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from database import supabase_admin
+from models import Blacklist, DndNumber
 
 logger = logging.getLogger(__name__)
 
@@ -16,13 +18,15 @@ IST = pytz.timezone("Asia/Kolkata")
 
 
 async def filter_dnd_numbers(
+    db: AsyncSession,
     numbers: list[str],
-    client_id: str,
+    client_id,
 ) -> tuple[list[str], list[str]]:
     """
     Filter a list of phone numbers against DND and client blacklists.
 
     Args:
+        db: Async database session.
         numbers: Normalized phone numbers (E.164 format).
         client_id: The client's UUID for checking their specific blacklist.
 
@@ -33,23 +37,18 @@ async def filter_dnd_numbers(
         return [], []
 
     # Fetch global DND list matching these numbers
-    dnd_response = (
-        supabase_admin.table("dnd_numbers")
-        .select("phone_number")
-        .in_("phone_number", numbers)
-        .execute()
+    dnd_result = await db.execute(
+        select(DndNumber.phone_number).where(DndNumber.phone_number.in_(numbers))
     )
-    dnd_set: set[str] = {row["phone_number"] for row in (dnd_response.data or [])}
+    dnd_set: set[str] = {row[0] for row in dnd_result.all()}
 
     # Fetch client-specific blacklist
-    blacklist_response = (
-        supabase_admin.table("blacklist")
-        .select("phone_number")
-        .eq("client_id", client_id)
-        .in_("phone_number", numbers)
-        .execute()
+    blacklist_result = await db.execute(
+        select(Blacklist.phone_number)
+        .where(Blacklist.client_id == client_id)
+        .where(Blacklist.phone_number.in_(numbers))
     )
-    blacklist_set: set[str] = {row["phone_number"] for row in (blacklist_response.data or [])}
+    blacklist_set: set[str] = {row[0] for row in blacklist_result.all()}
 
     blocked_set = dnd_set | blacklist_set
     clean_numbers = [n for n in numbers if n not in blocked_set]
@@ -66,7 +65,8 @@ async def filter_dnd_numbers(
 
 
 async def add_to_blacklist(
-    client_id: str,
+    db: AsyncSession,
+    client_id,
     phone_number: str,
     reason: str,
 ) -> None:
@@ -74,20 +74,18 @@ async def add_to_blacklist(
     Add a phone number to the client-specific blacklist.
 
     Args:
+        db: Async database session.
         client_id: The client's UUID.
         phone_number: Normalized phone number to block.
         reason: Human-readable reason for blocking.
     """
-    record = {
-        "id": str(uuid.uuid4()),
-        "client_id": client_id,
-        "phone_number": phone_number,
-        "reason": reason,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    supabase_admin.table("blacklist").upsert(
-        record, on_conflict="client_id,phone_number"
-    ).execute()
+    stmt = pg_insert(Blacklist).values(
+        client_id=client_id,
+        phone_number=phone_number,
+        reason=reason,
+    ).on_conflict_do_nothing(index_elements=["client_id", "phone_number"])
+    await db.execute(stmt)
+    await db.commit()
     logger.info("Added %s to blacklist for client %s (reason: %s)", phone_number, client_id, reason)
 
 

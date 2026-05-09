@@ -16,18 +16,16 @@ import anthropic
 import httpx
 
 from config import settings
-from database import supabase_admin
 
 logger = logging.getLogger(__name__)
 
 SARVAM_STT_URL = "https://api.sarvam.ai/speech-to-text"
-SARVAM_TTS_URL = "https://api.sarvam.ai/text-to-speech"
 SARVAM_TIMEOUT = 10.0
 
 CLAUDE_MODEL = "claude-sonnet-4-6"
 MAX_CONVERSATION_TURNS = 30  # safety limit
 
-# Mapping from campaign language to Sarvam language codes
+# Mapping from campaign language to Sarvam language codes (STT only)
 _LANGUAGE_CODES: dict[str, str] = {
     "hindi": "hi-IN",
     "english": "en-IN",
@@ -35,12 +33,12 @@ _LANGUAGE_CODES: dict[str, str] = {
     "tamil": "ta-IN",
 }
 
-# TTS speaker names (Sarvam AI speaker identifiers)
-_TTS_SPEAKERS: dict[str, dict[str, str]] = {
-    "hindi": {"male": "anand", "female": "anita"},
-    "english": {"male": "arjun", "female": "diya"},
-    "bangla": {"male": "arjun", "female": "diya"},
-    "tamil": {"male": "arjun", "female": "diya"},
+# ElevenLabs voice IDs per language/gender
+_ELEVENLABS_VOICES: dict[str, dict[str, str]] = {
+    "hindi": {"male": "TxGEqnHWrfWFTfGW9XjX", "female": "21m00Tcm4TlvDq8ikWAM"},
+    "english": {"male": "TxGEqnHWrfWFTfGW9XjX", "female": "21m00Tcm4TlvDq8ikWAM"},
+    "bangla": {"male": "TxGEqnHWrfWFTfGW9XjX", "female": "21m00Tcm4TlvDq8ikWAM"},
+    "tamil": {"male": "TxGEqnHWrfWFTfGW9XjX", "female": "21m00Tcm4TlvDq8ikWAM"},
 }
 
 # Pre-defined filler audio phrases per language (text that will be TTS'd on demand)
@@ -60,7 +58,7 @@ _anthropic_client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
 
 # ---------------------------------------------------------------------------
 # Audio format helpers (mulaw ↔ PCM ↔ WAV)
-# Twilio Media Streams use mulaw 8kHz; Sarvam AI expects WAV.
+# Twilio Media Streams use mulaw 8kHz; Sarvam AI STT expects WAV.
 # ---------------------------------------------------------------------------
 
 def mulaw_to_pcm(mulaw_data: bytes) -> bytes:
@@ -92,7 +90,7 @@ def _get_redis():
 
 class AIConversation:
     """
-    Manages one AI conversation tied to a single Exotel call.
+    Manages one AI conversation tied to a single Twilio call.
 
     State is persisted in Redis so that webhook handlers across multiple
     requests can resume the same conversation.
@@ -175,7 +173,7 @@ class AIConversation:
         await redis.delete(self._redis_key)
 
     # ------------------------------------------------------------------
-    # Sarvam AI integrations
+    # Sarvam AI STT
     # ------------------------------------------------------------------
 
     async def _stt(self, audio_bytes: bytes) -> str:
@@ -183,7 +181,7 @@ class AIConversation:
         Convert audio bytes to text using Sarvam AI STT.
 
         Args:
-            audio_bytes: Raw audio data (WAV/OGG format).
+            audio_bytes: Raw audio data (WAV format).
 
         Returns:
             Transcribed text string.
@@ -202,37 +200,37 @@ class AIConversation:
             logger.debug("STT result: %r", transcript[:100])
             return transcript
 
-    async def _tts(self, text: str) -> bytes:
-        """Convert text to audio using Sarvam AI TTS. Returns WAV bytes at 8kHz."""
-        lang_code = _LANGUAGE_CODES.get(self.language, "hi-IN")
-        speakers = _TTS_SPEAKERS.get(self.language, _TTS_SPEAKERS["english"])
-        speaker = speakers.get(self.agent_gender, speakers["female"])
+    # ------------------------------------------------------------------
+    # ElevenLabs TTS
+    # ------------------------------------------------------------------
 
-        async with httpx.AsyncClient(timeout=SARVAM_TIMEOUT) as client:
+    async def _tts(self, text: str) -> bytes:
+        """Convert text to mulaw 8kHz audio via ElevenLabs (direct Twilio-compatible output)."""
+        voice_id = _ELEVENLABS_VOICES.get(self.language, _ELEVENLABS_VOICES["english"]).get(
+            self.agent_gender, "21m00Tcm4TlvDq8ikWAM"
+        )
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+        async with httpx.AsyncClient(timeout=15.0) as client:
             response = await client.post(
-                SARVAM_TTS_URL,
+                url,
                 headers={
-                    "api-subscription-key": settings.sarvam_api_key,
+                    "xi-api-key": settings.elevenlabs_api_key,
                     "Content-Type": "application/json",
                 },
                 json={
-                    "inputs": [text],
-                    "target_language_code": lang_code,
-                    "speaker": speaker,
-                    "pitch": 0,
-                    "pace": 1.0,
-                    "loudness": 1.5,
-                    "speech_sample_rate": 8000,
-                    "enable_preprocessing": True,
-                    "model": "bulbul:v1",
+                    "text": text,
+                    "model_id": "eleven_multilingual_v2",
+                    "output_format": "ulaw_8000",  # Direct mulaw for Twilio — no conversion needed
+                    "voice_settings": {
+                        "stability": 0.5,
+                        "similarity_boost": 0.75,
+                        "style": 0.0,
+                        "use_speaker_boost": True,
+                    },
                 },
             )
             response.raise_for_status()
-            result = response.json()
-            # Sarvam returns base64-encoded audio
-            import base64
-            audio_b64: str = result["audios"][0]
-            return base64.b64decode(audio_b64)
+            return response.content  # already mulaw 8kHz bytes
 
     # ------------------------------------------------------------------
     # Claude AI
@@ -279,14 +277,14 @@ class AIConversation:
         2. Append to conversation history.
         3. Stream Claude response.
         4. Detect end-of-call marker.
-        5. Synthesize agent reply with Sarvam TTS.
+        5. Synthesize agent reply with ElevenLabs TTS.
         6. Persist updated state to Redis.
 
         Args:
-            audio_bytes: Raw audio from the customer's utterance.
+            audio_bytes: Raw audio from the customer's utterance (WAV).
 
         Returns:
-            Audio bytes of the agent's reply.
+            Mulaw 8kHz audio bytes of the agent's reply.
         """
         # Step 1: STT
         user_text = await self._stt(audio_bytes)
@@ -325,7 +323,7 @@ class AIConversation:
             language: Campaign language key.
 
         Returns:
-            Audio bytes of the filler phrase.
+            Mulaw 8kHz audio bytes of the filler phrase.
         """
         filler_text = _FILLER_TEXT.get(language, _FILLER_TEXT["english"])
         return await self._tts(filler_text)
@@ -338,7 +336,7 @@ class AIConversation:
         as the first message in the conversation.
 
         Returns:
-            Audio bytes of the opening greeting.
+            Mulaw 8kHz audio bytes of the opening greeting.
         """
         opening_prompt = (
             "Start the call now. Greet the customer, introduce yourself and your company "
@@ -360,39 +358,12 @@ class AIConversation:
 
     async def end_conversation(self, lead_status: str) -> None:
         """
-        Finalise the conversation: persist transcript and update DB records.
+        Finalise the conversation by setting lead status and cleaning up Redis.
 
         Args:
             lead_status: Final classification (INTERESTED, NOT_INTERESTED, etc.).
         """
         self.lead_status = lead_status
-
-        # Build plain-text transcript
-        transcript_lines = []
-        for msg in self.conversation_history:
-            role = "Customer" if msg["role"] == "user" else "Agent"
-            transcript_lines.append(f"{role}: {msg['content']}")
-        transcript_text = "\n".join(transcript_lines)
-
-        now = datetime.now(timezone.utc).isoformat()
-
-        if self.call_id:
-            supabase_admin.table("calls").update(
-                {
-                    "transcript": transcript_text,
-                    "lead_status": lead_status,
-                    "status": "completed",
-                    "ended_at": now,
-                }
-            ).eq("id", self.call_id).execute()
-
-        supabase_admin.table("phone_numbers").update(
-            {
-                "status": "called",
-                "lead_status": lead_status,
-            }
-        ).eq("id", self.phone_number_id).execute()
-
         await self.delete_state()
         logger.info(
             "Conversation ended: call_sid=%s, lead_status=%s", self.call_sid, lead_status

@@ -11,9 +11,12 @@ from datetime import datetime, timezone
 import razorpay
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import JSONResponse
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import settings
-from database import supabase_admin
+from database import get_db
+from models import Client, WalletTransaction
 from models.schemas import TopupRequest
 from routers.auth import get_current_user
 from services import wallet_manager
@@ -28,9 +31,12 @@ _razorpay_client = razorpay.Client(
 
 
 @router.get("/balance")
-async def get_balance(current_user: dict = Depends(get_current_user)) -> JSONResponse:
+async def get_balance(
+    current_user: Client = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> JSONResponse:
     """Return current wallet balance in paise and INR."""
-    balance_paise = await wallet_manager.get_balance(current_user["id"])
+    balance_paise = await wallet_manager.get_balance(db, current_user.id)
     return JSONResponse(
         content={
             "balance_paise": balance_paise,
@@ -43,21 +49,37 @@ async def get_balance(current_user: dict = Depends(get_current_user)) -> JSONRes
 async def list_transactions(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
-    current_user: dict = Depends(get_current_user),
+    current_user: Client = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ) -> JSONResponse:
     """Return paginated wallet transaction history for the current client."""
     offset = (page - 1) * page_size
-    response = (
-        supabase_admin.table("wallet_transactions")
-        .select("*")
-        .eq("client_id", current_user["id"])
-        .order("created_at", desc=True)
-        .range(offset, offset + page_size - 1)
-        .execute()
+    result = await db.execute(
+        select(WalletTransaction)
+        .where(WalletTransaction.client_id == current_user.id)
+        .order_by(WalletTransaction.created_at.desc())
+        .offset(offset)
+        .limit(page_size)
     )
+    transactions = result.scalars().all()
+
+    tx_list = [
+        {
+            "id": str(tx.id),
+            "client_id": str(tx.client_id),
+            "amount": tx.amount,
+            "type": tx.type,
+            "description": tx.description,
+            "razorpay_payment_id": tx.razorpay_payment_id,
+            "call_id": str(tx.call_id) if tx.call_id else None,
+            "created_at": tx.created_at.isoformat() if tx.created_at else None,
+        }
+        for tx in transactions
+    ]
+
     return JSONResponse(
         content={
-            "transactions": response.data or [],
+            "transactions": tx_list,
             "page": page,
             "page_size": page_size,
         }
@@ -67,7 +89,8 @@ async def list_transactions(
 @router.post("/topup/create-order")
 async def create_topup_order(
     body: TopupRequest,
-    current_user: dict = Depends(get_current_user),
+    current_user: Client = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ) -> JSONResponse:
     """
     Create a Razorpay order for wallet top-up.
@@ -81,9 +104,9 @@ async def create_topup_order(
             {
                 "amount": amount_paise,
                 "currency": "INR",
-                "receipt": f"topup_{current_user['id']}_{uuid.uuid4().hex[:8]}",
+                "receipt": f"topup_{current_user.id}_{uuid.uuid4().hex[:8]}",
                 "notes": {
-                    "client_id": current_user["id"],
+                    "client_id": str(current_user.id),
                     "purpose": "wallet_topup",
                 },
             }
@@ -108,7 +131,8 @@ async def create_topup_order(
 @router.post("/topup/verify")
 async def verify_topup(
     body: dict,
-    current_user: dict = Depends(get_current_user),
+    current_user: Client = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ) -> JSONResponse:
     """
     Verify Razorpay payment signature and credit the wallet on success.
@@ -136,7 +160,7 @@ async def verify_topup(
 
     if not hmac.compare_digest(expected_sig, signature):
         logger.warning(
-            "Invalid Razorpay signature for client %s, order %s", current_user["id"], order_id
+            "Invalid Razorpay signature for client %s, order %s", current_user.id, order_id
         )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -155,16 +179,17 @@ async def verify_topup(
         ) from exc
 
     await wallet_manager.credit(
-        client_id=current_user["id"],
+        db=db,
+        client_id=current_user.id,
         amount_paise=amount_paise,
         razorpay_payment_id=payment_id,
         description=f"Wallet top-up via Razorpay (order: {order_id})",
     )
 
-    new_balance = await wallet_manager.get_balance(current_user["id"])
+    new_balance = await wallet_manager.get_balance(db, current_user.id)
     logger.info(
         "Wallet credited: client=%s, amount=%d paise, payment=%s",
-        current_user["id"],
+        current_user.id,
         amount_paise,
         payment_id,
     )

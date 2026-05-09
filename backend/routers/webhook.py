@@ -13,17 +13,19 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Form, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
+from fastapi import APIRouter, Depends, Form, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import JSONResponse, Response
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import settings
-from database import supabase_admin
+from database import get_db, AsyncSessionLocal
+from models import Call, Campaign, PhoneNumber
 from services.ai_pipeline import (
     AIConversation,
     generate_call_summary,
     start_conversation,
     mulaw_to_pcm,
-    pcm_to_mulaw,
     pcm_to_wav,
 )
 from services.call_manager import schedule_callback_retry
@@ -73,6 +75,7 @@ async def twilio_call_connected(
     call_id: str = Query(...),
     CallSid: str = Form(...),
     CallStatus: Optional[str] = Form(None),
+    db: AsyncSession = Depends(get_db),
 ) -> Response:
     """
     Twilio fetches this URL when the call connects.
@@ -84,51 +87,52 @@ async def twilio_call_connected(
     logger.info("Call connected: CallSid=%s campaign=%s", CallSid, campaign_id)
 
     # Load campaign
-    campaign_resp = (
-        supabase_admin.table("campaigns")
-        .select("*")
-        .eq("id", campaign_id)
-        .single()
-        .execute()
+    campaign_result = await db.execute(
+        select(Campaign).where(Campaign.id == uuid.UUID(campaign_id))
     )
-    if not campaign_resp.data:
+    campaign = campaign_result.scalar_one_or_none()
+    if not campaign:
         logger.error("Campaign %s not found for CallSid=%s", campaign_id, CallSid)
         return _hangup_xml()
 
-    campaign = campaign_resp.data
     min_balance = settings.rate_per_min_paise * 2  # require at least 2 minutes
 
-    if not await wallet_manager.has_sufficient_balance(client_id, min_balance):
+    if not await wallet_manager.has_sufficient_balance(db, client_id, min_balance):
         logger.warning("Insufficient balance for client %s — hanging up %s", client_id, CallSid)
-        supabase_admin.table("campaigns").update({"status": "paused"}).eq("id", campaign_id).execute()
+        await db.execute(
+            update(Campaign)
+            .where(Campaign.id == uuid.UUID(campaign_id))
+            .values(status="paused")
+        )
+        await db.commit()
         return _hangup_xml()
 
     # Mark call as connected
-    now = datetime.now(timezone.utc).isoformat()
-    supabase_admin.table("calls").update({
-        "call_sid": CallSid,
-        "status": "connected",
-        "started_at": now,
-    }).eq("id", call_id).execute()
+    now = datetime.now(timezone.utc)
+    await db.execute(
+        update(Call)
+        .where(Call.id == uuid.UUID(call_id))
+        .values(call_sid=CallSid, status="connected", started_at=now)
+    )
 
     # Increment attempt counter
-    supabase_admin.table("phone_numbers").update({
-        "status": "calling",
-        "attempts": supabase_admin.table("phone_numbers")
-            .select("attempts")
-            .eq("id", phone_number_id)
-            .single()
-            .execute()
-            .data.get("attempts", 0) + 1,
-        "last_attempt_at": now,
-    }).eq("id", phone_number_id).execute()
+    pn_result = await db.execute(
+        select(PhoneNumber.attempts).where(PhoneNumber.id == uuid.UUID(phone_number_id))
+    )
+    current_attempts = pn_result.scalar_one_or_none() or 0
+    await db.execute(
+        update(PhoneNumber)
+        .where(PhoneNumber.id == uuid.UUID(phone_number_id))
+        .values(status="calling", attempts=current_attempts + 1, last_attempt_at=now)
+    )
+    await db.commit()
 
     # Initialise AI conversation state in Redis
     await start_conversation(
         call_sid=CallSid,
-        system_prompt=campaign["system_prompt"],
-        language=campaign["language"],
-        agent_gender=campaign.get("agent_gender", "female"),
+        system_prompt=campaign.system_prompt,
+        language=campaign.language,
+        agent_gender=campaign.agent_gender or "female",
         campaign_id=campaign_id,
         phone_number_id=phone_number_id,
         client_id=client_id,
@@ -305,36 +309,24 @@ async def _send_audio(
     audio_bytes: bytes,
 ) -> None:
     """
-    Send WAV/PCM audio to Twilio as mulaw chunks.
+    Send mulaw 8kHz audio to Twilio as chunked frames.
 
-    Twilio expects mulaw encoded audio streamed in small frames,
-    not one large blob.
+    ElevenLabs returns mulaw directly with ulaw_8000 output format,
+    so we send the bytes directly without any conversion.
     """
     if not stream_sid or not audio_bytes:
         return
 
-    # Convert WAV → raw PCM → mulaw
-    # If audio_bytes is already raw PCM (from Sarvam at 8kHz), skip WAV strip
-    pcm = _strip_wav_header(audio_bytes)
-    mulaw = pcm_to_mulaw(pcm)
-
     # Chunk into 160-byte frames (20ms at 8kHz)
     chunk_size = 160
-    for i in range(0, len(mulaw), chunk_size):
-        chunk = mulaw[i : i + chunk_size]
+    for i in range(0, len(audio_bytes), chunk_size):
+        chunk = audio_bytes[i:i + chunk_size]
         payload = base64.b64encode(chunk).decode("ascii")
         await websocket.send_text(json.dumps({
             "event": "media",
             "streamSid": stream_sid,
             "media": {"payload": payload},
         }))
-
-
-def _strip_wav_header(data: bytes) -> bytes:
-    """Remove 44-byte WAV header if present, returning raw PCM."""
-    if data[:4] == b"RIFF":
-        return data[44:]
-    return data
 
 
 def _rms(pcm: bytes) -> float:
@@ -356,6 +348,7 @@ async def twilio_call_status(
     CallSid: str = Form(...),
     CallStatus: str = Form(...),
     CallDuration: Optional[str] = Form("0"),
+    db: AsyncSession = Depends(get_db),
 ) -> JSONResponse:
     """
     Twilio calls this when call status changes (completed / failed / no-answer / busy).
@@ -365,28 +358,23 @@ async def twilio_call_status(
 
     duration_seconds = int(CallDuration or "0")
 
-    call_resp = (
-        supabase_admin.table("calls")
-        .select("*")
-        .eq("call_sid", CallSid)
-        .single()
-        .execute()
-    )
-    if not call_resp.data:
+    call_result = await db.execute(select(Call).where(Call.call_sid == CallSid))
+    call = call_result.scalar_one_or_none()
+    if not call:
         logger.warning("No call record for CallSid=%s", CallSid)
         return JSONResponse(content={"ok": False})
 
-    call = call_resp.data
-    call_id = call["id"]
-    client_id = call["client_id"]
-    campaign_id = call["campaign_id"]
-    phone_number_id = call["phone_number_id"]
+    call_id = call.id
+    client_id = call.client_id
+    campaign_id = call.campaign_id
+    phone_number_id = call.phone_number_id
 
     billable_minutes = math.ceil(duration_seconds / 60) if duration_seconds > 0 else 0
     cost_paise = billable_minutes * settings.rate_per_min_paise
 
     if cost_paise > 0:
         await wallet_manager.deduct(
+            db=db,
             client_id=client_id,
             amount_paise=cost_paise,
             description=f"Call charge: {billable_minutes} min × ₹{settings.rate_per_min_paise / 100:.2f}/min",
@@ -415,78 +403,57 @@ async def twilio_call_status(
         "failed": "failed",
     }
     final_status = status_map.get(CallStatus.lower(), "completed")
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc)
 
     ai_summary: Optional[str] = None
     if transcript:
         try:
-            campaign_resp = (
-                supabase_admin.table("campaigns")
-                .select("goal")
-                .eq("id", campaign_id)
-                .single()
-                .execute()
+            campaign_result = await db.execute(
+                select(Campaign.goal).where(Campaign.id == campaign_id)
             )
-            goal = campaign_resp.data["goal"] if campaign_resp.data else "qualify"
+            goal = campaign_result.scalar_one_or_none() or "qualify"
             ai_summary = await generate_call_summary(transcript, goal)
         except Exception as exc:
             logger.error("Summary generation failed for call %s: %s", call_id, exc)
 
-    supabase_admin.table("calls").update({
-        "status": final_status,
-        "duration_seconds": duration_seconds,
-        "cost_paise": cost_paise,
-        "transcript": transcript,
-        "ai_summary": ai_summary,
-        "lead_status": lead_status,
-        "ended_at": now,
-    }).eq("id", call_id).execute()
+    await db.execute(
+        update(Call)
+        .where(Call.id == call_id)
+        .values(
+            status=final_status,
+            duration_seconds=duration_seconds,
+            cost_paise=cost_paise,
+            transcript=transcript,
+            ai_summary=ai_summary,
+            lead_status=lead_status,
+            ended_at=now,
+        )
+    )
 
-    pn_update: dict = {"status": "called"}
+    pn_status = "called"
     if lead_status:
-        pn_update["status"] = lead_status.lower()
-    supabase_admin.table("phone_numbers").update(pn_update).eq("id", phone_number_id).execute()
+        pn_status = lead_status.lower()
+    await db.execute(
+        update(PhoneNumber)
+        .where(PhoneNumber.id == phone_number_id)
+        .values(status=pn_status)
+    )
+    await db.commit()
 
     if lead_status == "CALLBACK":
-        await schedule_callback_retry(phone_number_id, delay_seconds=3600)
-
-    if lead_status == "INTERESTED":
-        try:
-            pn_resp = (
-                supabase_admin.table("phone_numbers")
-                .select("number")
-                .eq("id", phone_number_id)
-                .single()
-                .execute()
-            )
-            customer_number = pn_resp.data["number"] if pn_resp.data else "unknown"
-            supabase_admin.table("whatsapp_alerts").insert({
-                "id": str(uuid.uuid4()),
-                "client_id": client_id,
-                "campaign_id": campaign_id,
-                "call_id": call_id,
-                "phone_number": customer_number,
-                "lead_status": lead_status,
-                "ai_summary": ai_summary,
-                "created_at": now,
-                "sent": False,
-            }).execute()
-        except Exception as exc:
-            logger.error("WhatsApp alert log failed for call %s: %s", call_id, exc)
+        await schedule_callback_retry(str(phone_number_id), delay_seconds=3600)
 
     if lead_status == "WRONG_NUMBER":
         try:
-            pn_resp = (
-                supabase_admin.table("phone_numbers")
-                .select("number")
-                .eq("id", phone_number_id)
-                .single()
-                .execute()
+            pn_result = await db.execute(
+                select(PhoneNumber.number).where(PhoneNumber.id == phone_number_id)
             )
-            if pn_resp.data:
+            phone_num = pn_result.scalar_one_or_none()
+            if phone_num:
                 await add_to_blacklist(
+                    db=db,
                     client_id=client_id,
-                    phone_number=pn_resp.data["number"],
+                    phone_number=phone_num,
                     reason="Wrong number reported during call",
                 )
         except Exception as exc:
@@ -508,6 +475,7 @@ async def twilio_recording(
     CallSid: str = Form(...),
     RecordingUrl: Optional[str] = Form(None),
     RecordingStatus: Optional[str] = Form(None),
+    db: AsyncSession = Depends(get_db),
 ) -> JSONResponse:
     """Store the Twilio recording URL once transcription is complete."""
     if RecordingStatus != "completed" or not RecordingUrl:
@@ -516,9 +484,12 @@ async def twilio_recording(
     # Twilio recording URLs need .mp3 appended
     recording_url = f"{RecordingUrl}.mp3"
 
-    supabase_admin.table("calls").update({
-        "recording_url": recording_url,
-    }).eq("call_sid", CallSid).execute()
+    await db.execute(
+        update(Call)
+        .where(Call.call_sid == CallSid)
+        .values(recording_url=recording_url)
+    )
+    await db.commit()
 
     logger.info("Recording saved for CallSid=%s: %s", CallSid, recording_url)
     return JSONResponse(content={"ok": True})
@@ -532,6 +503,7 @@ async def twilio_recording(
 async def razorpay_payment_webhook(
     request: Request,
     x_razorpay_signature: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
 ) -> JSONResponse:
     """Verify Razorpay webhook signature and credit wallet on payment.captured."""
     raw_body = await request.body()
@@ -565,7 +537,8 @@ async def razorpay_payment_webhook(
         return JSONResponse(content={"ok": False, "detail": "client_id not found"})
 
     await wallet_manager.credit(
-        client_id=client_id,
+        db=db,
+        client_id=uuid.UUID(client_id),
         amount_paise=amount_paise,
         razorpay_payment_id=payment_id,
         description=f"Wallet top-up via Razorpay (payment: {payment_id})",

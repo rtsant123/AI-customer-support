@@ -8,11 +8,13 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import redis.asyncio as aioredis
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import settings
+from database import engine, Base, get_db
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -38,8 +40,14 @@ redis_client: aioredis.Redis  # declared here, initialised in lifespan
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Connect to Redis on startup and close on shutdown."""
+    """Create DB tables, connect to Redis on startup; close on shutdown."""
     global redis_client
+
+    # Create tables (development convenience — use Alembic migrations in production)
+    logger.info("Creating database tables if they don't exist …")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    logger.info("Database tables ready.")
 
     logger.info("Connecting to Redis at %s …", settings.redis_url)
     redis_client = aioredis.from_url(
@@ -58,6 +66,7 @@ async def lifespan(app: FastAPI):
 
     logger.info("Closing Redis connection …")
     await redis_client.aclose()
+    await engine.dispose()
 
 
 # ---------------------------------------------------------------------------
@@ -99,8 +108,17 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
 # ---------------------------------------------------------------------------
 
 @app.get("/health", tags=["health"])
-async def health_check() -> dict[str, Any]:
-    """Return service health status including Redis connectivity."""
+async def health_check(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    """Return service health status including DB and Redis connectivity."""
+    from sqlalchemy import text
+
+    db_ok = False
+    try:
+        await db.execute(text("SELECT 1"))
+        db_ok = True
+    except Exception:
+        pass
+
     redis_ok = False
     try:
         await redis_client.ping()
@@ -109,8 +127,9 @@ async def health_check() -> dict[str, Any]:
         pass
 
     return {
-        "status": "ok" if redis_ok else "degraded",
-        "redis": "connected" if redis_ok else "disconnected",
+        "status": "ok" if (db_ok and redis_ok) else "degraded",
+        "db": db_ok,
+        "redis": redis_ok,
         "version": "1.0.0",
     }
 

@@ -6,10 +6,12 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
+from sqlalchemy import update
+from sqlalchemy.ext.asyncio import AsyncSession
 from twilio.rest import Client as TwilioClient
 
 from config import settings
-from database import supabase_admin
+from models import Call, PhoneNumber
 from services.queue_manager import schedule_retry
 
 logger = logging.getLogger(__name__)
@@ -20,29 +22,29 @@ def _twilio_client() -> TwilioClient:
 
 
 async def initiate_call(
+    db: AsyncSession,
     phone_number: str,
     campaign_id: str,
     phone_number_id: str,
-    client_id: str,
+    client_id,
 ) -> str:
     """
     Dial a number via Twilio and create a call record in the DB.
 
     Returns the Twilio CallSid string.
     """
-    call_id = str(uuid.uuid4())
-    now = datetime.now(timezone.utc).isoformat()
+    call_id = uuid.uuid4()
+    now = datetime.now(timezone.utc)
 
     # Twilio fetches this URL when the call connects to get TwiML instructions.
-    # We pass campaign context via query params so the webhook can look up the right campaign.
     twiml_url = (
         f"{settings.backend_url}/api/webhook/twilio/call-connected"
         f"?campaign_id={campaign_id}&phone_number_id={phone_number_id}&client_id={client_id}&call_id={call_id}"
     )
     status_callback_url = f"{settings.backend_url}/api/webhook/twilio/call-status"
 
-    client = _twilio_client()
-    call = client.calls.create(
+    twilio = _twilio_client()
+    call = twilio.calls.create(
         to=phone_number,
         from_=settings.twilio_phone_number,
         url=twiml_url,
@@ -56,20 +58,23 @@ async def initiate_call(
 
     call_sid: str = call.sid
 
-    supabase_admin.table("calls").insert({
-        "id": call_id,
-        "campaign_id": campaign_id,
-        "phone_number_id": phone_number_id,
-        "client_id": client_id,
-        "call_sid": call_sid,
-        "status": "initiated",
-        "started_at": now,
-    }).execute()
+    call_record = Call(
+        id=call_id,
+        campaign_id=uuid.UUID(campaign_id),
+        phone_number_id=uuid.UUID(phone_number_id),
+        client_id=client_id,
+        call_sid=call_sid,
+        status="initiated",
+        started_at=now,
+    )
+    db.add(call_record)
 
-    supabase_admin.table("phone_numbers").update({
-        "status": "calling",
-        "last_attempt_at": now,
-    }).eq("id", phone_number_id).execute()
+    await db.execute(
+        update(PhoneNumber)
+        .where(PhoneNumber.id == uuid.UUID(phone_number_id))
+        .values(status="calling", last_attempt_at=now)
+    )
+    await db.commit()
 
     logger.info("Initiated call %s → %s (Twilio SID: %s)", call_id, phone_number, call_sid)
     return call_sid

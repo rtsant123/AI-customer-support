@@ -1,21 +1,22 @@
-from pydantic_settings import BaseSettings
 from functools import lru_cache
+from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    # Supabase
-    supabase_url: str
-    supabase_service_key: str
-    supabase_anon_key: str
+    # Database
+    database_url: str  # postgresql+asyncpg://user:pass@host:5432/dbname
 
     # Twilio
     twilio_account_sid: str
     twilio_auth_token: str
-    twilio_phone_number: str  # E.164, e.g. +918XXXXXXXXX
-    backend_url: str  # Public URL of this server, e.g. https://your-app.railway.app
+    twilio_phone_number: str
+    backend_url: str
 
-    # Sarvam AI
+    # Sarvam AI (STT only)
     sarvam_api_key: str
+
+    # ElevenLabs (TTS)
+    elevenlabs_api_key: str
 
     # Anthropic
     anthropic_api_key: str
@@ -35,9 +36,10 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379"
 
     # App
-    secret_key: str
+    secret_key: str  # used for JWT signing
     frontend_url: str = "http://localhost:3000"
     rate_per_min_paise: int = 1200
+    jwt_expire_days: int = 30
 
     model_config = {"env_file": ".env", "case_sensitive": False}
 
