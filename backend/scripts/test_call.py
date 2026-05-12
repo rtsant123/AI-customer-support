@@ -10,7 +10,7 @@ import asyncio
 import sys
 import httpx
 
-BASE = "http://localhost:8000/api"
+BASE = "https://ai-customer-support-production-588c.up.railway.app/api"
 
 TEST_EMAIL = "test@aicaller.dev"
 TEST_PASSWORD = "testpass123"
