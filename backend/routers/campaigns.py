@@ -211,12 +211,12 @@ async def update_campaign(
     return JSONResponse(content={"campaign": _campaign_dict(refreshed)})
 
 
-@router.delete("/{campaign_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{campaign_id}")
 async def delete_campaign(
     campaign_id: str,
     current_user: Client = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
-) -> None:
+) -> JSONResponse:
     """Soft-delete a campaign by setting status to 'deleted'."""
     result = await db.execute(
         select(Campaign)
@@ -231,6 +231,7 @@ async def delete_campaign(
         .values(status="deleted")
     )
     await db.commit()
+    return JSONResponse(status_code=200, content={"ok": True})
     logger.info("Soft-deleted campaign %s", campaign_id)
 
 
