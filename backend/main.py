@@ -97,10 +97,9 @@ app.add_middleware(
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     logger.error("Unhandled exception on %s %s: %s", request.method, request.url.path, exc, exc_info=True)
-    return JSONResponse(
-        status_code=500,
-        content={"error": "An internal server error occurred. Please try again later."},
-    )
+    # Show real error in dev mode so we can debug
+    msg = str(exc) if settings.dev_mode else "An internal server error occurred. Please try again later."
+    return JSONResponse(status_code=500, content={"error": msg, "type": type(exc).__name__})
 
 
 # ---------------------------------------------------------------------------
