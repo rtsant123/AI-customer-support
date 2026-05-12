@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from datetime import datetime, timezone
+from functools import partial
 
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -44,16 +46,21 @@ async def initiate_call(
     status_callback_url = f"{settings.backend_url}/api/webhook/twilio/call-status"
 
     twilio = _twilio_client()
-    call = twilio.calls.create(
-        to=phone_number,
-        from_=settings.twilio_phone_number,
-        url=twiml_url,
-        status_callback=status_callback_url,
-        status_callback_event=["completed", "failed", "no-answer", "busy"],
-        status_callback_method="POST",
-        record=True,
-        recording_status_callback=f"{settings.backend_url}/api/webhook/twilio/recording",
-        recording_status_callback_method="POST",
+    loop = asyncio.get_event_loop()
+    call = await loop.run_in_executor(
+        None,
+        partial(
+            twilio.calls.create,
+            to=phone_number,
+            from_=settings.twilio_phone_number,
+            url=twiml_url,
+            status_callback=status_callback_url,
+            status_callback_event=["completed", "failed", "no-answer", "busy"],
+            status_callback_method="POST",
+            record=True,
+            recording_status_callback=f"{settings.backend_url}/api/webhook/twilio/recording",
+            recording_status_callback_method="POST",
+        ),
     )
 
     call_sid: str = call.sid

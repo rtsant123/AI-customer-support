@@ -144,13 +144,17 @@ async def trigger_test_call(
     await db.refresh(pn)
 
     # Fire the call
-    call_sid = await initiate_call(
-        db=db,
-        phone_number=to,
-        campaign_id=str(campaign.id),
-        phone_number_id=str(pn.id),
-        client_id=client.id,
-    )
+    try:
+        call_sid = await initiate_call(
+            db=db,
+            phone_number=to,
+            campaign_id=str(campaign.id),
+            phone_number_id=str(pn.id),
+            client_id=client.id,
+        )
+    except Exception as exc:
+        logger.error("Test call failed to %s: %s", to, exc)
+        return JSONResponse(status_code=500, content={"detail": str(exc)})
 
     logger.info("Dev test call initiated to %s, SID=%s", to, call_sid)
     return JSONResponse(content={
