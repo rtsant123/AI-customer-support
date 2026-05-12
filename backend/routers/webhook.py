@@ -97,7 +97,7 @@ async def twilio_call_connected(
 
     min_balance = settings.rate_per_min_paise * 2  # require at least 2 minutes
 
-    if not await wallet_manager.has_sufficient_balance(db, client_id, min_balance):
+    if not settings.dev_mode and not await wallet_manager.has_sufficient_balance(db, client_id, min_balance):
         logger.warning("Insufficient balance for client %s — hanging up %s", client_id, CallSid)
         await db.execute(
             update(Campaign)

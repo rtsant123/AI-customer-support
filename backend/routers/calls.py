@@ -144,14 +144,17 @@ async def get_recording(
             detail="Recording not available for this call",
         )
 
+    # If R2 is not configured, redirect directly to the Twilio recording URL
+    if not settings.r2_enabled:
+        return RedirectResponse(url=call.recording_url, status_code=status.HTTP_302_FOUND)
+
     # Derive the R2 object key from the stored URL or call_sid
     recording_url: str = call.recording_url
-    public_url_prefix = settings.r2_public_url.rstrip("/") + "/"
+    public_url_prefix = (settings.r2_public_url or "").rstrip("/") + "/"
 
     if recording_url.startswith(public_url_prefix):
         object_key = recording_url.removeprefix(public_url_prefix)
     else:
-        # Fallback: use call_sid as key
         object_key = f"recordings/{call.call_sid}.mp3"
 
     r2 = _get_r2_client()
