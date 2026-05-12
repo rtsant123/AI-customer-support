@@ -143,9 +143,11 @@ from routers.campaigns import router as campaigns_router  # noqa: E402
 from routers.calls import router as calls_router  # noqa: E402
 from routers.wallet import router as wallet_router  # noqa: E402
 from routers.webhook import router as webhook_router  # noqa: E402
+from routers.dev import router as dev_router  # noqa: E402
 
 app.include_router(auth_router, prefix="/api")
 app.include_router(campaigns_router, prefix="/api")
 app.include_router(calls_router, prefix="/api")
 app.include_router(wallet_router, prefix="/api")
 app.include_router(webhook_router, prefix="/api")
+app.include_router(dev_router, prefix="/api")
